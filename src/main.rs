@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fs::File;
+use std::fs;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -88,6 +89,10 @@ impl<'a> Pickle<'a> {
         let (inst_name, loc) = get_identifier(&syntax_tree, id);
 
         let unused_exclude = library && !self.inst_table.contains(inst_name.as_str());
+
+        if library && !unused_exclude {
+            debug!("inst_name contains {:?}", inst_name);
+        }
 
         if unused_exclude || self.exclude.contains(inst_name.as_str()) {
             debug!("Exclude `{}`: {:?}", inst_name, loc);
@@ -267,9 +272,24 @@ fn main() -> Result<()> {
         file_list.extend(u);
     }
 
-    // for path in matches.values_of("library_dir").into_iter().flatten() {
-    //
-    // }
+    for dir in matches.values_of("library_dir").into_iter().flatten() {
+        let mut files: Vec<String> = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let dir = entry?;
+            let s = dir.path().into_os_string().into_string().unwrap();
+
+            if s.ends_with(".v") || s.ends_with(".sv") {
+                files.push(s);
+            }
+        }
+
+        file_list.push(FileBundle {
+            include_dirs: include_dirs.clone(),
+            defines: defines.clone(),
+            files: files,
+            library: true,
+        });
+    }
 
     if let Some(library_names) = matches.values_of("library_file") {
         file_list.push(FileBundle {
@@ -432,7 +452,8 @@ fn main() -> Result<()> {
     for pf in &syntax_trees {
         for node in &pf.ast {
             match node {
-                // check for module instantiations
+                // check for module instantiations so that unused modules from libraries can be
+                // excluded
                 RefNode::ModuleInstantiation(x) => {
                     let id = unwrap_node!(x, SimpleIdentifier).unwrap();
                     pickle.register_instantiation(&pf.ast, id);
@@ -480,11 +501,11 @@ fn main() -> Result<()> {
                 }
                 RefNode::InterfaceDeclaration(x) => {
                     let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap(), pf.library)
+                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap(), false)
                 }
                 RefNode::PackageDeclaration(x) => {
                     let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap(), pf.library)
+                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap(), false)
                 }
                 _ => (),
             }
