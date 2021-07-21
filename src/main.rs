@@ -83,10 +83,13 @@ impl<'a> Pickle<'a> {
             .push((loc.offset, loc.len, new_name.clone()));
     }
 
-    // Check whether a given declaration should be striped from the sources.
-    fn register_exclude(&mut self, syntax_tree: &SyntaxTree, id: RefNode, locate: Locate) {
+    // Check whether a given declaration should be stripped from the sources.
+    fn register_exclude(&mut self, syntax_tree: &SyntaxTree, id: RefNode, locate: Locate, library: bool) {
         let (inst_name, loc) = get_identifier(&syntax_tree, id);
-        if self.exclude.contains(inst_name.as_str()) {
+
+        let unused_exclude = library && !self.inst_table.contains(inst_name.as_str());
+
+        if unused_exclude || self.exclude.contains(inst_name.as_str()) {
             debug!("Exclude `{}`: {:?}", inst_name, loc);
             self.replace_table
                 .push((locate.offset, locate.len, "".to_string()));
@@ -199,6 +202,22 @@ fn main() -> Result<()> {
             Arg::with_name("write_undefined")
                 .long("write-undefined")
                 .help("Output a list of undefined modules to `undefined.morty`"),
+        ).arg(
+            Arg::with_name("library_dir")
+                .long("ydir")
+                .value_name("DIR")
+                .help("Directory to search for SystemVerilog modules")
+                .takes_value(true)
+                .multiple(true)
+                .number_of_values(1),
+        ).arg(
+            Arg::with_name("library_file")
+                .long("vlib")
+                .value_name("FILE")
+                .help("File to search for SystemVerilog modules")
+                .takes_value(true)
+                .multiple(true)
+                .number_of_values(1),
         )
         .get_matches();
 
@@ -248,11 +267,25 @@ fn main() -> Result<()> {
         file_list.extend(u);
     }
 
+    // for path in matches.values_of("library_dir").into_iter().flatten() {
+    //
+    // }
+
+    if let Some(library_names) = matches.values_of("library_file") {
+        file_list.push(FileBundle {
+            include_dirs: include_dirs.clone(),
+            defines: defines.clone(),
+            files: library_names.map(String::from).collect(),
+            library: true,
+        });
+    }
+
     if let Some(file_names) = matches.values_of("INPUT") {
         file_list.push(FileBundle {
-            include_dirs,
-            defines,
+            include_dirs: include_dirs,
+            defines: defines,
             files: file_names.map(String::from).collect(),
+            library: false,
         });
     }
 
@@ -329,6 +362,7 @@ fn main() -> Result<()> {
                     path: filename.clone(),
                     source: buffer,
                     ast: syntax_tree,
+                    library: bundle.library,
                 })
             })
             .collect();
@@ -395,6 +429,19 @@ fn main() -> Result<()> {
         }
     }
 
+    for pf in &syntax_trees {
+        for node in &pf.ast {
+            match node {
+                // check for module instantiations
+                RefNode::ModuleInstantiation(x) => {
+                    let id = unwrap_node!(x, SimpleIdentifier).unwrap();
+                    pickle.register_instantiation(&pf.ast, id);
+                }
+                _ => (),
+            }
+        }
+    }
+
     // Emit the pickled source files.
     for pf in &syntax_trees {
         // For each file, start with a clean replacement table.
@@ -402,10 +449,6 @@ fn main() -> Result<()> {
         // Iterate again and check for usage
         for node in &pf.ast {
             match node {
-                RefNode::ModuleInstantiation(x) => {
-                    let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                    pickle.register_instantiation(&pf.ast, id);
-                }
                 // Instantiations, end-labels.
                 RefNode::ModuleIdentifier(x) => {
                     let id = unwrap_node!(x, SimpleIdentifier).unwrap();
@@ -429,19 +472,19 @@ fn main() -> Result<()> {
                 // Check whether we want to exclude the given module from the file sources.
                 RefNode::ModuleDeclarationAnsi(x) => {
                     let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap())
+                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap(), pf.library)
                 }
                 RefNode::ModuleDeclarationNonansi(x) => {
                     let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap())
+                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap(), pf.library)
                 }
                 RefNode::InterfaceDeclaration(x) => {
                     let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap())
+                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap(), pf.library)
                 }
                 RefNode::PackageDeclaration(x) => {
                     let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap())
+                    pickle.register_exclude(&pf.ast, id, Locate::try_from(x).unwrap(), pf.library)
                 }
                 _ => (),
             }
@@ -501,6 +544,7 @@ struct FileBundle {
     include_dirs: Vec<String>,
     defines: HashMap<String, Option<String>>,
     files: Vec<String>,
+    library: bool,
 }
 
 /// A parsed input file.
@@ -511,6 +555,8 @@ pub struct ParsedFile {
     pub source: String,
     /// The parsed AST of the file.
     pub ast: SyntaxTree,
+    /// If this file is a "library" file (modules loaded only as needed).
+    pub library: bool,
 }
 
 #[cfg_attr(tarpaulin, skip)]
