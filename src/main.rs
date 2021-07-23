@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::io::Write;
 use std::io;
+use std::fs;
 use sv_parser::preprocess;
 use sv_parser::Error as SvParserError;
 use sv_parser::{parse_sv_pp, unwrap_node, Define, DefineText, Locate, RefNode, SyntaxTree};
@@ -28,7 +29,7 @@ mod printer;
 
 /// Struct containing information about
 /// what should be pickled and how.
-#[derive(Debug)]
+// #[derive(Debug)]
 struct Pickle<'a> {
     /// Optional name prefix.
     prefix: Option<&'a str>,
@@ -44,6 +45,7 @@ struct Pickle<'a> {
     replace_table: Vec<(usize, usize, String)>,
     /// A set of instantiated modules.
     inst_table: HashSet<String>,
+    targets: Vec<ParsedFile>,
 }
 
 impl<'a> Pickle<'a> {
@@ -90,6 +92,64 @@ impl<'a> Pickle<'a> {
             debug!("Exclude `{}`: {:?}", inst_name, loc);
             self.replace_table
                 .push((locate.offset, locate.len, "".to_string()));
+        }
+    }
+
+    fn load_library_module(&mut self, module_name: &str, library_bundle: &FileBundle) {
+        for f in &library_bundle.files {
+            let mut suffix = module_name.to_owned();
+            suffix.push_str(".sv");
+            if f.ends_with(&suffix) {
+                info!("parsing {}", f);
+                let bundle_include_dirs: Vec<_> = library_bundle.include_dirs.iter().map(Path::new).collect();
+                // Convert the preprocessor defines into the appropriate format which is understood by `sv-parser`
+                let bundle_defines: HashMap<_, _> = library_bundle
+                    .defines
+                    .iter()
+                    .map(|(name, value)| {
+                        // If there is a define text add it.
+                        let define_text = match value {
+                            Some(x) => Some(DefineText::new(String::from(x), None)),
+                            None => None,
+                        };
+                        (
+                            name.clone(),
+                            Some(Define::new(name.clone(), vec![], define_text)),
+                        )
+                    })
+                    .collect();
+
+                let v = parse_file(f, &bundle_include_dirs, &bundle_defines, true);
+
+                if let Ok(pf) = v {
+                    for node in &pf.ast {
+                        match node {
+                            // Module declarations.
+                            RefNode::ModuleDeclarationAnsi(x) => {
+                                // unwrap_node! gets the nearest ModuleIdentifier from x
+                                let id = unwrap_node!(x, SimpleIdentifier).unwrap();
+                                self.register_declaration(&pf.ast, id);
+                            }
+                            RefNode::ModuleDeclarationNonansi(x) => {
+                                let id = unwrap_node!(x, SimpleIdentifier).unwrap();
+                                self.register_declaration(&pf.ast, id);
+                            }
+                            RefNode::ModuleInstantiation(x) => {
+                                let id = unwrap_node!(x, SimpleIdentifier).unwrap();
+                                self.register_instantiation(&pf.ast, id.clone());
+
+                                let (inst_name, _) = get_identifier(&pf.ast, id);
+                                info!("Instantiation in library module {}", &inst_name);
+                                if !self.rename_table.contains_key(&inst_name) {
+                                    self.load_library_module(&inst_name, library_bundle);
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                    self.targets.push(pf);
+                }
+            }
         }
     }
 }
@@ -199,6 +259,22 @@ fn main() -> Result<()> {
             Arg::with_name("write_undefined")
                 .long("write-undefined")
                 .help("Output a list of undefined modules to `undefined.morty`"),
+        ).arg(
+            Arg::with_name("library_file")
+                .long("library-file")
+                .help("File to search for SystemVerilog modules")
+                .value_name("FILE")
+                .takes_value(true)
+                .multiple(true)
+                .number_of_values(1),
+        ).arg(
+            Arg::with_name("library_dir")
+                .long("library-dir")
+                .help("Directory to search for SystemVerilog modules")
+                .value_name("DIR")
+                .takes_value(true)
+                .multiple(true)
+                .number_of_values(1),
         )
         .get_matches();
 
@@ -235,6 +311,30 @@ fn main() -> Result<()> {
         .map(|x| x.to_string())
         .collect();
 
+    let mut library_files = Vec::new();
+
+    for dir in matches.values_of("library_dir").into_iter().flatten() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let dir = entry.unwrap();
+            let s = dir.path().into_os_string().into_string().unwrap();
+
+            if s.ends_with(".v") || s.ends_with(".sv") {
+                library_files.push(s);
+            }
+        }
+    }
+
+    if let Some(library_names) = matches.values_of("library_file") {
+        library_files.push(library_names.map(String::from).collect());
+    }
+
+    let library_bundle = FileBundle {
+        include_dirs: include_dirs.clone(),
+        defines: defines.clone(),
+        files: library_files,
+        library: true,
+    };
+
     for path in matches.values_of("file_list").into_iter().flatten() {
         let file = File::open(path).unwrap();
         let reader = BufReader::new(file);
@@ -253,6 +353,7 @@ fn main() -> Result<()> {
             include_dirs,
             defines,
             files: file_names.map(String::from).collect(),
+            library: false,
         });
     }
 
@@ -270,6 +371,7 @@ fn main() -> Result<()> {
         rename_table: HashMap::new(),
         replace_table: vec![],
         inst_table: HashSet::new(),
+        targets: Vec::new(),
     };
 
     // Parse the input files.
@@ -304,32 +406,7 @@ fn main() -> Result<()> {
             .files
             .par_iter()
             .map(|filename| -> Result<_> {
-                info!("{:?}", filename);
-
-                // Preprocess the verilog files.
-                let pp = preprocess(
-                    filename,
-                    &bundle_defines,
-                    &bundle_include_dirs,
-                    strip_comments,
-                    false,
-                )
-                .with_context(|| format!("Failed to preprocess `{}`", filename))?;
-
-                let buffer = pp.0.text().to_string();
-                let syntax_tree = parse_sv_pp(pp.0, pp.1, false)
-                    .or_else(|err| -> Result<_> {
-                        let mut printer = &mut *printer.lock().unwrap();
-                        print_parse_error(&mut printer, &err, false)?;
-                        Err(Error::new(err))
-                    })?
-                    .0;
-
-                Ok(ParsedFile {
-                    path: filename.clone(),
-                    source: buffer,
-                    ast: syntax_tree,
-                })
+                parse_file(&filename, &bundle_include_dirs, &bundle_defines, strip_comments)
             })
             .collect();
         syntax_trees.extend(v?);
@@ -396,7 +473,7 @@ fn main() -> Result<()> {
     }
 
     // Emit the pickled source files.
-    for pf in &syntax_trees {
+    for pf in syntax_trees {
         // For each file, start with a clean replacement table.
         pickle.replace_table.clear();
         // Iterate again and check for usage
@@ -404,7 +481,13 @@ fn main() -> Result<()> {
             match node {
                 RefNode::ModuleInstantiation(x) => {
                     let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                    pickle.register_instantiation(&pf.ast, id);
+                    pickle.register_instantiation(&pf.ast, id.clone());
+
+                    let (inst_name, _) = get_identifier(&pf.ast, id);
+                    if !pickle.rename_table.contains_key(&inst_name) {
+                        info!("could not find {}", &inst_name);
+                        pickle.load_library_module(&inst_name, &library_bundle);
+                    }
                 }
                 // Instantiations, end-labels.
                 RefNode::ModuleIdentifier(x) => {
@@ -446,6 +529,9 @@ fn main() -> Result<()> {
                 _ => (),
             }
         }
+        pickle.targets.push(pf);
+    }
+    for pf in &pickle.targets {
         // Replace according to `replace_table`.
         // Apply the replacements.
         debug!("Replace Table: {:?}", pickle.replace_table);
@@ -482,6 +568,35 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn parse_file(filename: &str, bundle_include_dirs: &Vec<&Path>, bundle_defines: &HashMap<String, Option<Define>>, strip_comments: bool) -> Result<ParsedFile> {
+    info!("{:?}", filename);
+
+    // Preprocess the verilog files.
+    let pp = preprocess(
+        filename,
+        &bundle_defines,
+        &bundle_include_dirs,
+        strip_comments,
+        false,
+    )
+    .with_context(|| format!("Failed to preprocess `{}`", filename))?;
+
+    let buffer = pp.0.text().to_string();
+    let syntax_tree = parse_sv_pp(pp.0, pp.1, false)
+        .or_else(|err| -> Result<_> {
+            // let mut printer = &mut *printer.lock().unwrap();
+            // print_parse_error(&mut printer, &err, false)?;
+            Err(Error::new(err))
+        })?
+        .0;
+
+    Ok(ParsedFile {
+        path: String::from(filename),
+        source: buffer,
+        ast: syntax_tree,
+    })
+}
+
 fn get_identifier(st: &SyntaxTree, node: RefNode) -> (String, Locate) {
     // unwrap_node! can take multiple types
     match unwrap_node!(node, SimpleIdentifier, EscapedIdentifier) {
@@ -501,6 +616,7 @@ struct FileBundle {
     include_dirs: Vec<String>,
     defines: HashMap<String, Option<String>>,
     files: Vec<String>,
+    library: bool,
 }
 
 /// A parsed input file.
