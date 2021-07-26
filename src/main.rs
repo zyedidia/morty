@@ -7,9 +7,8 @@
 #[macro_use]
 extern crate log;
 
-use anyhow::{Context as _, Error, Result};
+use anyhow::{Result};
 use clap::{App, Arg};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
@@ -199,6 +198,22 @@ fn main() -> Result<()> {
             Arg::with_name("write_undefined")
                 .long("write-undefined")
                 .help("Output a list of undefined modules to `undefined.morty`"),
+        ).arg(
+            Arg::with_name("library_dir")
+                .long("--library-dir")
+                .value_name("DIR")
+                .help("Directory to search for SystemVerilog modules")
+                .takes_value(true)
+                .multiple(true)
+                .number_of_values(1),
+        ).arg(
+            Arg::with_name("library_file")
+                .long("library-file")
+                .value_name("FILE")
+                .help("File to search for SystemVerilog modules")
+                .takes_value(true)
+                .multiple(true)
+                .number_of_values(1),
         )
         .get_matches();
 
@@ -250,9 +265,38 @@ fn main() -> Result<()> {
 
     if let Some(file_names) = matches.values_of("INPUT") {
         file_list.push(FileBundle {
-            include_dirs,
-            defines,
+            include_dirs: include_dirs.clone(),
+            defines: defines.clone(),
             files: file_names.map(String::from).collect(),
+            library: false,
+        });
+    }
+
+    for dir in matches.values_of("library_dir").into_iter().flatten() {
+        let mut files: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let dir = entry?;
+            let s = dir.path().into_os_string().into_string().unwrap();
+
+            if s.ends_with(".v") || s.ends_with(".sv") {
+                files.push(s);
+            }
+        }
+
+        file_list.push(FileBundle {
+            include_dirs: include_dirs.clone(),
+            defines: defines.clone(),
+            files: files,
+            library: true,
+        });
+    }
+
+    if let Some(library_names) = matches.values_of("library_file") {
+        file_list.push(FileBundle {
+            include_dirs: include_dirs,
+            defines: defines,
+            files: library_names.map(String::from).collect(),
+            library: true,
         });
     }
 
@@ -274,9 +318,12 @@ fn main() -> Result<()> {
 
     // Parse the input files.
     let printer = Arc::new(Mutex::new(printer::Printer::new()));
-    let mut syntax_trees = vec![];
+    let mut syntax_trees: Vec<ParsedFile> = vec![];
 
     let strip_comments = matches.is_present("strip_comments");
+
+    let mut unique_files: HashSet<String> = HashSet::new();
+
     for bundle in file_list {
         let bundle_include_dirs: Vec<_> = bundle.include_dirs.iter().map(Path::new).collect();
         // Convert the preprocessor defines into the appropriate format which is understood by `sv-parser`
@@ -300,38 +347,65 @@ fn main() -> Result<()> {
         // Use a neat trick of `collect` here, which allows you to collect a
         // `Result<T>` iterator into a `Result<Vec<T>>`, i.e. bubbling up the
         // error.
-        let v: Result<Vec<ParsedFile>> = bundle
-            .files
-            .par_iter()
-            .map(|filename| -> Result<_> {
-                info!("{:?}", filename);
 
-                // Preprocess the verilog files.
-                let pp = preprocess(
-                    filename,
-                    &bundle_defines,
-                    &bundle_include_dirs,
-                    strip_comments,
-                    false,
-                )
-                .with_context(|| format!("Failed to preprocess `{}`", filename))?;
+        let mut pfs: Vec<Result<ParsedFile>> = vec![];
 
-                let buffer = pp.0.text().to_string();
-                let syntax_tree = parse_sv_pp(pp.0, pp.1, false)
-                    .or_else(|err| -> Result<_> {
+        for filename in &bundle.files {
+            if unique_files.contains(filename.as_str()) {
+                continue;
+            }
+
+            info!("{:?}", filename);
+
+            let pp_r = preprocess(
+                filename,
+                &bundle_defines,
+                &bundle_include_dirs,
+                strip_comments,
+                false,
+            );
+
+            let pp = match pp_r {
+                Ok(pp) => pp,
+                Err(e) => {
+                    if !bundle.library {
+                        eprintln!("Failed to preprocess `{}`", filename);
+                        pfs.push(Err(e.into()));
+                    } else {
+                        info!("Ignoring preprocessor error in `{}`", filename);
+                    }
+                    continue;
+                }
+            };
+
+            let buffer = pp.0.text().to_string();
+
+            let syntax_tree_r = parse_sv_pp(pp.0, pp.1, false);
+
+            let syntax_tree = match syntax_tree_r {
+                Ok(syntax_tree) => syntax_tree.0,
+                Err(e) => {
+                    if !bundle.library {
                         let mut printer = &mut *printer.lock().unwrap();
-                        print_parse_error(&mut printer, &err, false)?;
-                        Err(Error::new(err))
-                    })?
-                    .0;
+                        print_parse_error(&mut printer, &e, false)?;
+                        pfs.push(Err(e.into()));
+                    } else {
+                        info!("Ignoring syntax error in `{}`", filename);
+                    }
+                    continue;
+                }
+            };
 
-                Ok(ParsedFile {
-                    path: filename.clone(),
-                    source: buffer,
-                    ast: syntax_tree,
-                })
-            })
-            .collect();
+            unique_files.insert(filename.clone());
+
+            pfs.push(Ok(ParsedFile {
+                path: filename.clone(),
+                source: buffer,
+                ast: syntax_tree,
+            }));
+        }
+
+        let v: Result<Vec<ParsedFile>> = pfs.into_iter().collect();
         syntax_trees.extend(v?);
     }
 
@@ -501,6 +575,7 @@ struct FileBundle {
     include_dirs: Vec<String>,
     defines: HashMap<String, Option<String>>,
     files: Vec<String>,
+    library: bool,
 }
 
 /// A parsed input file.
