@@ -49,6 +49,7 @@ struct Pickle<'a> {
     inst_table: HashSet<String>,
     /// Information for library files
     libs: LibraryBundle,
+    files: Vec<String>,
 }
 
 impl<'a> Pickle<'a> {
@@ -102,7 +103,7 @@ impl<'a> Pickle<'a> {
     // This function may recursively load other modules if the library uses another library module.
     // If no module is found in the library bundle, this function does nothing.
     fn load_library_module(&mut self, module_name: &str, files: &mut Vec<ParsedFile>) {
-        if let Ok(pf) = self.libs.load_module(module_name) {
+        if let Ok(pf) = self.libs.load_module(module_name, &mut self.files) {
             // register all declarations from this library file.
             for node in &pf.ast {
                 match node {
@@ -270,6 +271,11 @@ fn main() -> Result<()> {
                 .multiple(true)
                 .number_of_values(1),
         )
+        .arg(
+            Arg::with_name("write_filelist")
+                .long("write-filelist")
+                .help("Output the file list used for pickling to `filelist.morty`")
+        )
         .get_matches();
 
     // Instantiate a new logger with the verbosity level the user requested.
@@ -377,6 +383,7 @@ fn main() -> Result<()> {
         replace_table: vec![],
         inst_table: HashSet::new(),
         libs: library_bundle,
+        files: vec![],
     };
 
     // Parse the input files.
@@ -386,6 +393,10 @@ fn main() -> Result<()> {
     for bundle in file_list {
         let bundle_include_dirs: Vec<_> = bundle.include_dirs.iter().map(Path::new).collect();
         let bundle_defines = defines_to_sv_parser(&bundle.defines);
+
+        for filename in &bundle.files {
+            pickle.files.push(filename.to_string());
+        }
 
         // For each file in the file bundle preprocess and parse it.
         // Use a neat trick of `collect` here, which allows you to collect a
@@ -567,6 +578,14 @@ fn main() -> Result<()> {
         f.flush().unwrap();
     }
 
+    if matches.is_present("write_filelist") {
+        let mut f = BufWriter::new(File::create("filelist.morty").unwrap());
+        for name in &pickle.files {
+            writeln!(f, "{}", name).unwrap();
+        }
+        f.flush().unwrap();
+    }
+
     Ok(())
 }
 
@@ -669,7 +688,7 @@ struct LibraryBundle {
 }
 
 impl LibraryBundle {
-    fn load_module(&self, module_name: &str) -> Result<ParsedFile, Error> {
+    fn load_module(&self, module_name: &str, files: &mut Vec<String>) -> Result<ParsedFile, Error> {
         // check if the module is in the hashmap
         let f = match self.files.get(module_name) {
             Some(p) => p.to_string_lossy(),
@@ -680,6 +699,8 @@ impl LibraryBundle {
 
         let bundle_include_dirs: Vec<_> = self.include_dirs.iter().map(Path::new).collect();
         let bundle_defines = defines_to_sv_parser(&self.defines);
+
+        files.push(f.to_string());
 
         // if so, parse the file and return the result (comments are always stripped).
         return parse_file(&f, &bundle_include_dirs, &bundle_defines, true);
