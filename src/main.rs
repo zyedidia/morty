@@ -362,8 +362,8 @@ fn main() -> Result<()> {
 
     if let Some(file_names) = matches.values_of("INPUT") {
         file_list.push(FileBundle {
-            include_dirs,
-            defines,
+            include_dirs: include_dirs.clone(),
+            defines: defines.clone(),
             files: file_names.map(String::from).collect(),
         });
     }
@@ -390,7 +390,7 @@ fn main() -> Result<()> {
     let mut syntax_trees = vec![];
 
     let strip_comments = matches.is_present("strip_comments");
-    for bundle in file_list {
+    for bundle in &file_list {
         let bundle_include_dirs: Vec<_> = bundle.include_dirs.iter().map(Path::new).collect();
         let bundle_defines = defines_to_sv_parser(&bundle.defines);
 
@@ -578,6 +578,12 @@ fn main() -> Result<()> {
         f.flush().unwrap();
     }
 
+    let total_bundle = FileBundle{
+        include_dirs: include_dirs.clone(),
+        defines: defines.clone(),
+        files: pickle.files.clone(),
+    };
+
     if matches.is_present("write_filelist") {
         let mut f = BufWriter::new(File::create("filelist.morty").unwrap());
         for name in &pickle.files {
@@ -585,6 +591,9 @@ fn main() -> Result<()> {
         }
         f.flush().unwrap();
     }
+
+    let json = serde_json::to_string_pretty(&total_bundle).unwrap();
+    println!("{}", json);
 
     Ok(())
 }
