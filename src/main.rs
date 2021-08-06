@@ -254,11 +254,6 @@ fn main() -> Result<()> {
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("write_undefined")
-                .long("write-undefined")
-                .help("Output a list of undefined modules to `undefined.morty`"),
-        )
-        .arg(
             Arg::with_name("library_file")
                 .long("library-file")
                 .help("File to search for SystemVerilog modules")
@@ -269,6 +264,7 @@ fn main() -> Result<()> {
         )
         .arg(
             Arg::with_name("library_dir")
+                .short("y")
                 .long("library-dir")
                 .help("Directory to search for SystemVerilog modules")
                 .value_name("DIR")
@@ -277,9 +273,11 @@ fn main() -> Result<()> {
                 .number_of_values(1),
         )
         .arg(
-            Arg::with_name("write_filelist")
-                .long("write-filelist")
-                .help("Output the file list used for pickling to `filelist.morty`")
+            Arg::with_name("manifest")
+                .long("manifest")
+                .value_name("FILE")
+                .help("Output a JSON-encoded source information manifest to FILE")
+                .takes_value(true),
         )
         .get_matches();
 
@@ -433,7 +431,6 @@ fn main() -> Result<()> {
             eprintln!("{}:", pf.path);
             writeln!(out, "{:}", pf.source).unwrap();
         }
-        out.flush().unwrap();
         return Ok(());
     }
 
@@ -566,39 +563,47 @@ fn main() -> Result<()> {
             writeln!(out).unwrap();
         }
     }
-    out.flush().unwrap();
 
-    let mut undef_modules = Vec::new();
+    // if the user requested a manifest we need to compute the information and output it in json
+    // form
+    if let Some(manifest_file) = matches.value_of("manifest") {
+        let mut undef_modules = Vec::new();
 
-    for name in &pickle.inst_table {
-        if !pickle.rename_table.contains_key(name) {
-            undef_modules.push(name.to_string());
+        // find undefined modules
+        for name in &pickle.inst_table {
+            if !pickle.rename_table.contains_key(name) {
+                undef_modules.push(name.to_string());
+            }
         }
-    }
 
-    let mut top_modules = Vec::new();
+        let mut top_modules = Vec::new();
 
-    for (_old_name, new_name) in &pickle.rename_table {
-        if !pickle.inst_table.contains(new_name) {
-            top_modules.push(new_name.to_string());
+        // find top modules
+        for (_old_name, new_name) in &pickle.rename_table {
+            if !pickle.inst_table.contains(new_name) {
+                top_modules.push(new_name.to_string());
+            }
         }
+
+        // bundle the library files that were used
+        let lib_bundle = FileBundle{
+            include_dirs: include_dirs.clone(),
+            defines: defines.clone(),
+            files: pickle.used_libs.clone(),
+        };
+
+        file_list.push(lib_bundle);
+
+        let json = serde_json::to_string_pretty(&Manifest{
+            files: file_list,
+            tops: top_modules,
+            undefined: undef_modules,
+        }).unwrap();
+
+        let path = Path::new(manifest_file);
+        let mut out = Box::new(BufWriter::new(File::create(&path).unwrap())) as Box<dyn Write>;
+        writeln!(out, "{}", json).unwrap();
     }
-
-
-    let lib_bundle = FileBundle{
-        include_dirs: include_dirs.clone(),
-        defines: defines.clone(),
-        files: pickle.used_libs.clone(),
-    };
-
-    file_list.push(lib_bundle);
-
-    let json = serde_json::to_string_pretty(&Manifest{
-        files: file_list,
-        tops: top_modules,
-        undefined: undef_modules,
-    }).unwrap();
-    println!("{}", json);
 
     Ok(())
 }
