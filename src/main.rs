@@ -49,7 +49,7 @@ struct Pickle<'a> {
     inst_table: HashSet<String>,
     /// Information for library files
     libs: LibraryBundle,
-    files: Vec<String>,
+    used_libs: Vec<String>,
 }
 
 impl<'a> Pickle<'a> {
@@ -103,44 +103,49 @@ impl<'a> Pickle<'a> {
     // This function may recursively load other modules if the library uses another library module.
     // If no module is found in the library bundle, this function does nothing.
     fn load_library_module(&mut self, module_name: &str, files: &mut Vec<ParsedFile>) {
-        if let Ok(pf) = self.libs.load_module(module_name, &mut self.files) {
-            // register all declarations from this library file.
-            for node in &pf.ast {
-                match node {
-                    RefNode::ModuleDeclarationAnsi(x) => {
-                        let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                        self.register_declaration(&pf.ast, id);
-                    }
-                    RefNode::ModuleDeclarationNonansi(x) => {
-                        let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                        self.register_declaration(&pf.ast, id);
-                    }
-                    _ => (),
-                }
-            }
-            // look for all module instantiations
-            for node in &pf.ast {
-                match node {
-                    RefNode::ModuleInstantiation(x) => {
-                        let id = unwrap_node!(x, SimpleIdentifier).unwrap();
-                        self.register_instantiation(&pf.ast, id.clone());
-
-                        // if this module is undefined, recursively attempt to load a library
-                        // module for it.
-                        let (inst_name, _) = get_identifier(&pf.ast, id);
-                        info!(
-                            "Instantiation `{}` in library module `{}`",
-                            &inst_name, &module_name
-                        );
-                        if !self.rename_table.contains_key(&inst_name) {
-                            self.load_library_module(&inst_name, files);
+        let rm = self.libs.load_module(module_name, &mut self.used_libs);
+        match rm {
+            Ok(pf) => {
+                // register all declarations from this library file.
+                for node in &pf.ast {
+                    match node {
+                        RefNode::ModuleDeclarationAnsi(x) => {
+                            let id = unwrap_node!(x, SimpleIdentifier).unwrap();
+                            self.register_declaration(&pf.ast, id);
                         }
+                        RefNode::ModuleDeclarationNonansi(x) => {
+                            let id = unwrap_node!(x, SimpleIdentifier).unwrap();
+                            self.register_declaration(&pf.ast, id);
+                        }
+                        _ => (),
                     }
-                    _ => (),
                 }
-            }
-            // add the parsed file to the vector.
-            files.push(pf);
+                // look for all module instantiations
+                for node in &pf.ast {
+                    match node {
+                        RefNode::ModuleInstantiation(x) => {
+                            let id = unwrap_node!(x, SimpleIdentifier).unwrap();
+                            self.register_instantiation(&pf.ast, id.clone());
+
+                            // if this module is undefined, recursively attempt to load a library
+                            // module for it.
+                            let (inst_name, _) = get_identifier(&pf.ast, id);
+                            info!(
+                                "Instantiation `{}` in library module `{}`",
+                                &inst_name, &module_name
+                            );
+                            if !self.rename_table.contains_key(&inst_name) {
+                                info!("load library module {}", &inst_name);
+                                self.load_library_module(&inst_name, files);
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+                // add the parsed file to the vector.
+                files.push(pf);
+            },
+            Err(e) => info!("error loading library: {}", e)
         }
     }
 }
@@ -383,7 +388,7 @@ fn main() -> Result<()> {
         replace_table: vec![],
         inst_table: HashSet::new(),
         libs: library_bundle,
-        files: vec![],
+        used_libs: vec![],
     };
 
     // Parse the input files.
@@ -393,10 +398,6 @@ fn main() -> Result<()> {
     for bundle in &file_list {
         let bundle_include_dirs: Vec<_> = bundle.include_dirs.iter().map(Path::new).collect();
         let bundle_defines = defines_to_sv_parser(&bundle.defines);
-
-        for filename in &bundle.files {
-            pickle.files.push(filename.to_string());
-        }
 
         // For each file in the file bundle preprocess and parse it.
         // Use a neat trick of `collect` here, which allows you to collect a
@@ -567,32 +568,36 @@ fn main() -> Result<()> {
     }
     out.flush().unwrap();
 
-    if matches.is_present("write_undefined") {
-        let mut f = BufWriter::new(File::create("undefined.morty").unwrap());
-        for name in &pickle.inst_table {
-            if !pickle.rename_table.contains_key(name) {
-                write!(f, "{} ", name).unwrap();
-            }
+    let mut undef_modules = Vec::new();
+
+    for name in &pickle.inst_table {
+        if !pickle.rename_table.contains_key(name) {
+            undef_modules.push(name.to_string());
         }
-        writeln!(f).unwrap();
-        f.flush().unwrap();
     }
 
-    let total_bundle = FileBundle{
+    let mut top_modules = Vec::new();
+
+    for (_old_name, new_name) in &pickle.rename_table {
+        if !pickle.inst_table.contains(new_name) {
+            top_modules.push(new_name.to_string());
+        }
+    }
+
+
+    let lib_bundle = FileBundle{
         include_dirs: include_dirs.clone(),
         defines: defines.clone(),
-        files: pickle.files.clone(),
+        files: pickle.used_libs.clone(),
     };
 
-    if matches.is_present("write_filelist") {
-        let mut f = BufWriter::new(File::create("filelist.morty").unwrap());
-        for name in &pickle.files {
-            writeln!(f, "{}", name).unwrap();
-        }
-        f.flush().unwrap();
-    }
+    file_list.push(lib_bundle);
 
-    let json = serde_json::to_string_pretty(&total_bundle).unwrap();
+    let json = serde_json::to_string_pretty(&Manifest{
+        files: file_list,
+        tops: top_modules,
+        undefined: undef_modules,
+    }).unwrap();
     println!("{}", json);
 
     Ok(())
@@ -680,6 +685,16 @@ fn get_identifier(st: &SyntaxTree, node: RefNode) -> (String, Locate) {
         }
         _ => panic!("No identifier found."),
     }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Manifest {
+    // list of file bundles
+    files: Vec<FileBundle>,
+    // list of top modules
+    tops: Vec<String>,
+    // list of undefined modules
+    undefined: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
